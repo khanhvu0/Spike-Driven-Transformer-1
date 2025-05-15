@@ -4,6 +4,7 @@ import yaml
 import os
 import logging
 import numpy as np
+import json
 from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
@@ -44,6 +45,7 @@ from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 import model, dvs_utils, criterion
+from torchvision.datasets import ImageFolder
 
 try:
     from apex import amp
@@ -204,6 +206,12 @@ parser.add_argument(
     default=4,
     type=int,
     help="",
+)
+parser.add_argument(
+    "--firing-thresholds",
+    default=None,
+    type=str,
+    help="Comma-separated list of firing thresholds for each layer (e.g., '0.002,0.003,0.004'). If not provided, default values will be used.",
 )
 parser.add_argument(
     "--in-channels",
@@ -861,6 +869,25 @@ parser.add_argument(
     default=False,
     help="log training and validation metrics to wandb",
 )
+parser.add_argument(
+    "--early-exit",
+    action="store_true",
+    default=False,
+    help="Enable early exit inference (SEENN-I style)",
+)
+parser.add_argument(
+    "--exit-threshold",
+    type=float,
+    default=0.9,
+    help="Confidence threshold for early exit (default: 0.9)",
+)
+parser.add_argument(
+    "--exit-metric",
+    type=str,
+    default="confidence",
+    choices=["confidence", "entropy"],
+    help="Metric for early exit: 'confidence' (max softmax) or 'entropy' (normalized)",
+)
 
 _logger = logging.getLogger("train")
 stream_handler = logging.StreamHandler()
@@ -952,6 +979,21 @@ def main():
     if args.dataset in ["cifar10-dvs-tet", "cifar10-dvs"]:
         args.dvs_mode = True
 
+    # # Parse firing thresholds if provided
+    # firing_thresholds = None
+    # if args.firing_thresholds:
+    #     try:
+    #         firing_thresholds = [float(t) for t in args.firing_thresholds.split(',')]
+    #         if args.local_rank == 0:
+    #             _logger.info(f"Using custom firing thresholds: {firing_thresholds}")
+    #     except:
+    #         _logger.warning(f"Could not parse firing thresholds: {args.firing_thresholds}. Using defaults.")
+    # else:
+    #     # Default uniform threshold of 0.005
+    #     firing_thresholds = [0.01] * 8  # Using 8 as default number of layers
+    #     if args.local_rank == 0:
+    #         _logger.info(f"Using default firing threshold of 0.005 for all layers: {firing_thresholds}")
+
     model = create_model(
         args.model,
         T=args.time_steps,
@@ -974,6 +1016,7 @@ def main():
         spike_mode=args.spike_mode,
         dvs_mode=args.dvs_mode,
         TET=args.TET,
+        # firing_thresholds=firing_thresholds,
     )
     if args.local_rank == 0:
         _logger.info(f"Creating model {args.model}")
@@ -1143,6 +1186,19 @@ def main():
 
     # create the train and eval datasets
     dataset_train, dataset_eval = None, None
+    
+    # Handle custom class mapping if needed
+    custom_class_to_idx = None
+    if args.dataset == "imagenet" and os.path.exists(os.path.join(args.data_dir, "class_mapping.json")):
+        # Load the custom class mapping
+        with open(os.path.join(args.data_dir, "class_mapping.json"), 'r') as f:
+            custom_class_map = json.load(f)
+        
+        # Create a mapping from custom folder names to indices
+        custom_class_to_idx = {k: i for i, k in enumerate(custom_class_map.keys())}
+        if args.local_rank == 0:
+            _logger.info(f"Loaded custom class mapping with {len(custom_class_to_idx)} classes")
+    
     if args.dataset == "cifar10-dvs-tet":
         dataset_train = dvs_utils.DVSCifar10(
             root=os.path.join(args.data_dir, "train"),
@@ -1178,6 +1234,32 @@ def main():
             frames_number=args.time_steps,
             split_by="number",
         )
+    elif args.dataset == "imagenet" and custom_class_to_idx is not None:
+        # Use custom dataset with our class mapping
+        train_dir = os.path.join(args.data_dir, "train")
+        val_dir = os.path.join(args.data_dir, "val")
+        if args.local_rank == 0:
+            _logger.info(f"Using custom ImageFolder with class mapping for training data in {train_dir}")
+            _logger.info(f"Using custom ImageFolder with class mapping for validation data in {val_dir}")
+        
+        # Define transforms
+        transform_train = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        transform_val = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Create datasets with custom class mapping
+        dataset_train = CustomImageFolder(train_dir, transform=transform_train, class_to_idx=custom_class_to_idx)
+        dataset_eval = CustomImageFolder(val_dir, transform=transform_val, class_to_idx=custom_class_to_idx)
     else:
         dataset_train = create_dataset(
             args.dataset,
@@ -1381,7 +1463,7 @@ def main():
                 distribute_bn(model, args.world_size, args.dist_bn == "reduce")
 
             eval_metrics = validate(
-                model, loader_eval, validate_loss_fn, args, amp_autocast=amp_autocast
+                model, loader_eval, validate_loss_fn, args, output_dir=output_dir, amp_autocast=amp_autocast, log_suffix=""
             )
 
             if model_ema is not None and not args.model_ema_force_cpu:
@@ -1392,6 +1474,7 @@ def main():
                     loader_eval,
                     validate_loss_fn,
                     args,
+                    output_dir=output_dir,
                     amp_autocast=amp_autocast,
                     log_suffix=" (EMA)",
                 )
@@ -1420,9 +1503,114 @@ def main():
                 _logger.info(
                     "*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch)
                 )
+                
 
-    except KeyboardInterrupt:
-        pass
+        # After training is complete, load the best model and run a final validation with firing rate statistics
+        if args.local_rank == 0 and output_dir:
+            _logger.info('Training complete, running final validation with firing rate statistics on best model...')
+            best_checkpoint = os.path.join(output_dir, 'model_best.pth.tar')
+            
+            if os.path.exists(best_checkpoint):
+                # Create a new model instance to avoid any remnant state
+                best_model = create_model(
+                    args.model,
+                    T=args.time_steps,
+                    pretrained=args.pretrained,
+                    drop_rate=args.drop,
+                    drop_path_rate=args.drop_path,
+                    drop_block_rate=args.drop_block,
+                    num_heads=args.num_heads,
+                    num_classes=args.num_classes,
+                    pooling_stat=args.pooling_stat,
+                    img_size_h=args.img_size,
+                    img_size_w=args.img_size,
+                    patch_size=args.patch_size,
+                    embed_dims=args.dim,
+                    mlp_ratios=args.mlp_ratio,
+                    in_channels=args.in_channels,
+                    qkv_bias=False,
+                    depths=args.layer,
+                    sr_ratios=1,
+                    spike_mode=args.spike_mode,
+                    dvs_mode=args.dvs_mode,
+                    TET=args.TET,
+                )
+                best_model = best_model.cuda()
+                
+                # Load the best checkpoint
+                _logger.info(f'Loading best model from {best_checkpoint}')
+                checkpoint = torch.load(best_checkpoint, map_location='cuda')
+                if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                    state_dict = clean_state_dict(checkpoint['state_dict'])
+                    best_model.load_state_dict(state_dict, strict=False)
+                else:
+                    best_model.load_state_dict(checkpoint)
+                
+                # Run validation with firing rate statistics
+                best_model.eval()
+                _logger.info('Running validation with firing rate statistics...')
+                best_eval_metrics = validate(
+                    best_model, 
+                    loader_eval, 
+                    validate_loss_fn, 
+                    args, 
+                    output_dir=output_dir,
+                    amp_autocast=amp_autocast,
+                    log_suffix=' (Best Model)'
+                )
+                
+                # Log the results
+                _logger.info('\nBest model validation results:')
+                _logger.info(f"Top-1 Accuracy: {best_eval_metrics['top1']:.2f}%")
+                _logger.info(f"Top-5 Accuracy: {best_eval_metrics['top5']:.2f}%")
+                
+                if args.early_exit and args.dataset == "cifar10-dvs":
+                    _logger.info("Running early exit inference (SEENN-I style)...")
+                    acc, avg_time, time_ratio = early_exit_inference(model, loader_eval, args)
+                    _logger.info(f"[Early Exit] Threshold: {args.exit_threshold}, Avg Time: {avg_time:.2f}, Acc: {acc:.2f}, Portion: {time_ratio}")
+                    
+                
+                # Log firing rate statistics
+                if 'firing_rate' in best_eval_metrics:
+                    # _logger.info('\nFiring Rate Statistics:')
+                    firing_rate_str = json.dumps(best_eval_metrics['firing_rate'], indent=4)
+                    # _logger.info(firing_rate_str)
+                
+                # Log non-zero activation statistics
+                if 'non_zero' in best_eval_metrics:
+                    # _logger.info('\nNon-Zero Activation Statistics:')
+                    non_zero_str = json.dumps(best_eval_metrics['non_zero'], indent=4)
+                    # _logger.info(non_zero_str)
+                
+                # Save the statistics to a separate file
+                stats_file = os.path.join(output_dir, 'best_model_firing_stats.json')
+                with open(stats_file, 'w') as f:
+                    json.dump({
+                        'top1': best_eval_metrics['top1'],
+                        'top5': best_eval_metrics['top5'],
+                        'firing_rate': best_eval_metrics['firing_rate'],
+                        'non_zero': best_eval_metrics['non_zero']
+                    }, f, indent=4)
+                _logger.info(f'Saved firing statistics to {stats_file}')
+            else:
+                _logger.warning(f'Best model checkpoint not found at {best_checkpoint}')
+
+    except Exception as e:
+        if args.local_rank == 0:
+            _logger.error(f"Error during training: {str(e)}")
+            _logger.exception(e)  # This logs the traceback
+            
+            # Try to save an emergency checkpoint
+            if saver is not None and args.recovery_interval:
+                _logger.info("Attempting to save emergency checkpoint...")
+                try:
+                    save_path = output_dir / f'emergency-checkpoint-{epoch}.pth.tar'
+                    saver.save_checkpoint(epoch, metric=0, use_amp=args.amp)
+                    _logger.info(f"Emergency checkpoint saved to {save_path}")
+                except Exception as save_error:
+                    _logger.error(f"Failed to save emergency checkpoint: {str(save_error)}")
+        raise  # Re-raise the exception
+
     if best_metric is not None:
         _logger.info("*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch))
 
@@ -1567,12 +1755,14 @@ def train_one_epoch(
                         normalize=True,
                     )
 
-        if (
-            saver is not None
-            and args.recovery_interval
-            and (last_batch or (batch_idx + 1) % args.recovery_interval == 0)
-        ):
-            saver.save_recovery(epoch, batch_idx=batch_idx)
+            # Save recovery checkpoints more frequently
+            if saver is not None and args.recovery_interval and (
+                last_batch or (batch_idx + 1) % args.recovery_interval == 0
+            ):
+                _logger.info(f"Saving partial checkpoint at batch {batch_idx}")
+                saver.save_recovery(
+                    epoch, batch_idx=batch_idx, use_amp=use_amp
+                )
 
         if lr_scheduler is not None:
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
@@ -1587,38 +1777,99 @@ def train_one_epoch(
     return OrderedDict([("loss", losses_m.avg)])
 
 
-def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix=""):
+def validate(model, loader, loss_fn, args, output_dir=None, amp_autocast=suppress, log_suffix=""):
     batch_time_m = AverageMeter()
     losses_m = AverageMeter()
     top1_m = AverageMeter()
     top5_m = AverageMeter()
 
+    # Initialize dictionaries for non-zero and firing rate metrics, per time step
+    fr_dict = {}
+    nz_dict = {}
+    # Dynamically create dictionaries for each time step
+    for t in range(args.time_steps):
+        fr_dict[f"t{t}"] = dict()
+        nz_dict[f"t{t}"] = dict()
+    
+    # Helper functions to calculate firing rates and non-zero activations
+    def calc_non_zero_rate(s_dict, nz_dict, idx, t):
+        for k, v_ in s_dict.items():
+            v = v_[t, ...]
+            x_shape = torch.tensor(list(v.shape))
+            all_neural = torch.prod(x_shape)
+            z = torch.nonzero(v)
+            if k in nz_dict.keys():
+                nz_dict[k] += (z.shape[0] / all_neural).item() / idx
+            else:
+                nz_dict[k] = (z.shape[0] / all_neural).item() / idx
+        return nz_dict
+
+    def calc_firing_rate(s_dict, fr_dict, idx, t):
+        for k, v_ in s_dict.items():
+            v = v_[t, ...]
+            if k in fr_dict.keys():
+                fr_dict[k] += v.mean().item() / idx
+            else:
+                fr_dict[k] = v.mean().item() / idx
+        return fr_dict
+
     model.eval()
     # functional.reset_net(model)
+
+    spike_stats_batches = min(10, len(loader))  # Collect stats for at most 10 batches to avoid OOM
 
     end = time.time()
     last_idx = len(loader) - 1
     with torch.no_grad():
         for batch_idx, (input, target) in enumerate(loader):
+            # Clear cache before processing each batch
+            torch.cuda.empty_cache()
+            
+            last_batch = batch_idx == last_idx
             input = input.float()
             if (target >= 1000).sum() != 0 or (target < 0).sum() != 0:
                 print(target)
 
-            last_batch = batch_idx == last_idx
             if not args.prefetcher or args.dataset in dvs_utils.DVS_DATASET:
                 if args.amp and not isinstance(input, torch.cuda.HalfTensor):
                     input = input.half()
                 input = input.cuda()
-                target = target.cuda()
+            target = target.cuda()
+
             if args.channels_last:
                 input = input.contiguous(memory_format=torch.channels_last)
 
             with amp_autocast():
-                output = model(input)
-            if isinstance(output, (tuple, list)):
-                output = output[0]
-            if args.TET:
-                output = output.mean(0)
+                # Collect spike statistics for the first few batches
+                collect_stats = batch_idx < spike_stats_batches
+                
+                if collect_stats:
+                    # Collect spike statistics
+                    output, firing_dict = model(input, hook=dict())
+                    
+                    # Calculate firing statistics for each time step
+                    for t in range(args.time_steps):
+                        fr_dict[f"t{t}"] = calc_firing_rate(
+                            firing_dict, fr_dict[f"t{t}"], spike_stats_batches, t
+                        )
+                        nz_dict[f"t{t}"] = calc_non_zero_rate(
+                            firing_dict, nz_dict[f"t{t}"], spike_stats_batches, t
+                        )
+                    
+                    # Clear firing dict to free memory
+                    del firing_dict
+                    torch.cuda.empty_cache()
+                else:
+                    # Standard forward pass without collecting spike statistics
+                    output = model(input)
+                
+                # Handle output format
+                if isinstance(output, (tuple, list)):
+                    output = output[0]
+                    
+                # Handle TET models
+                if args.TET:
+                    output = output.mean(0)
 
             # augmentation reduction
             reduce_factor = args.tta
@@ -1626,8 +1877,6 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                 output = output.unfold(0, reduce_factor, reduce_factor).mean(dim=2)
                 target = target[0 : target.size(0) : reduce_factor]
 
-            if (target >= 1000).sum() != 0 or (target < 0).sum() != 0:
-                print(target)
             loss = loss_fn(output, target)
             functional.reset_net(model)
 
@@ -1667,12 +1916,133 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix="")
                         top5=top5_m,
                     )
                 )
+    
+    # Final memory cleanup
+    torch.cuda.empty_cache()
+
+    # Collect firing statistics from model methods as a fallback
+    if all(not fr_dict[k] for k in fr_dict) and hasattr(model, 'get_firing_rates'):
+        fr_dict = model.get_firing_rates()
+    elif all(not fr_dict[k] for k in fr_dict) and hasattr(model, 'module') and hasattr(model.module, 'get_firing_rates'):
+        fr_dict = model.module.get_firing_rates()
+    
+    if all(not nz_dict[k] for k in nz_dict) and hasattr(model, 'get_nonzero_activations'):
+        nz_dict = model.get_nonzero_activations()
+    elif all(not nz_dict[k] for k in nz_dict) and hasattr(model, 'module') and hasattr(model.module, 'get_nonzero_activations'):
+        nz_dict = model.module.get_nonzero_activations()
 
     metrics = OrderedDict(
-        [("loss", losses_m.avg), ("top1", top1_m.avg), ("top5", top5_m.avg)]
+        [
+            ("loss", losses_m.avg),
+            ("top1", top1_m.avg),
+            ("top5", top5_m.avg),
+            ("non_zero", nz_dict),
+            ("firing_rate", fr_dict),
+        ]
     )
 
     return metrics
+
+
+def early_exit_inference(model, loader, args):
+    """
+    Implements SEENN-I style early exit for SNNs.
+    Args:
+        model: The SNN model (should output (T, B, num_classes) if TET is True)
+        loader: DataLoader
+        args: argparse args (should have exit_threshold, exit_metric, time_steps)
+    Returns:
+        accuracy, avg_timesteps, timestep_hist (portion of samples exited at each timestep)
+    """
+    import math
+    model.eval()
+    device = next(model.parameters()).device
+    correct = 0
+    total = 0
+    time_vec = np.zeros(args.time_steps)
+    
+    with torch.no_grad():
+        for input, target in loader:
+            # Reset network state before each batch
+            functional.reset_net(model)
+            
+            input = input.float().to(device)
+            target = target.to(device)
+            
+            # Model forward: get (T, B, num_classes) or (B, num_classes)
+            output, _ = model(input)
+            
+            # Handle different output shapes based on TET
+            if args.TET:
+                # output: (T, B, num_classes)
+                T, B, C = output.shape
+                assert T == args.time_steps, f"Model output T={T} != args.time_steps={args.time_steps}"
+            else:
+                # output: (B, num_classes)
+                B, C = output.shape
+                # For non-TET case, we can't do early exit since we don't have temporal information
+                pred = output.argmax(dim=1)
+                correct += (pred == target).sum().item()
+                total += target.size(0)
+                time_vec[0] += target.size(0)  # All samples exit at first timestep
+                continue
+
+            # For each sample in batch, do early exit (only for TET=True case)
+            for b in range(B):
+                partial_logits = torch.zeros(C, device=device)
+                for t in range(T):
+                    partial_logits += output[t, b]
+                    if args.exit_metric == "confidence":
+                        probs = torch.softmax(partial_logits, dim=0)
+                        confidence = probs.max().item()
+                        metric_val = confidence
+                    elif args.exit_metric == "entropy":
+                        probs = torch.log_softmax(partial_logits, dim=0)
+                        entropy = -torch.sum(probs.exp() * probs).item() / math.log(C)
+                        metric_val = 1 - entropy  # higher is more confident
+                    else:
+                        raise NotImplementedError
+                    if metric_val > args.exit_threshold or t == T - 1:
+                        pred = partial_logits.argmax().item()
+                        correct += int(pred == target[b].item())
+                        total += 1
+                        time_vec[t] += 1
+                        break
+                        
+            # Clear CUDA cache after each batch
+            torch.cuda.empty_cache()
+            
+    acc = 100.0 * correct / total if total > 0 else 0.0
+    avg_time = np.dot(time_vec, np.arange(1, args.time_steps + 1)) / total if total > 0 else 0.0
+    time_ratio = time_vec / total if total > 0 else time_vec
+    print(f"Early Exit: Threshold={args.exit_threshold}, Metric={args.exit_metric}, Acc={acc:.2f}, Avg Time={avg_time:.2f}, Portion={time_ratio}")
+    return acc, avg_time, time_ratio
+
+
+# Add CustomImageFolder class for custom class mapping
+class CustomImageFolder(ImageFolder):
+    def __init__(self, root, transform=None, target_transform=None, loader=None, class_to_idx=None, **kwargs):
+        # Use the default loader from ImageFolder if none is provided
+        if loader is None:
+            from torchvision.datasets.folder import default_loader
+            loader = default_loader
+            
+        super().__init__(root=root, transform=transform, 
+                         target_transform=target_transform,
+                         loader=loader)
+                         
+        if class_to_idx is not None:
+            self.classes = list(class_to_idx.keys())
+            self.class_to_idx = class_to_idx
+            # Update targets based on custom mapping
+            samples = []
+            for path, _ in self.samples:
+                folder_name = os.path.basename(os.path.dirname(path))
+                if folder_name in self.class_to_idx:
+                    target = self.class_to_idx[folder_name]
+                    samples.append((path, target))
+            self.samples = samples
+            self.targets = [s[1] for s in self.samples]
 
 
 if __name__ == "__main__":

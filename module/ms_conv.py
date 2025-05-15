@@ -91,6 +91,7 @@ class MS_SSA_Conv(nn.Module):
         spike_mode="lif",
         dvs=False,
         layer=0,
+        skip_attention=False,
     ):
         super().__init__()
         assert (
@@ -99,6 +100,7 @@ class MS_SSA_Conv(nn.Module):
         self.dim = dim
         self.dvs = dvs
         self.num_heads = num_heads
+        self.skip_attention = skip_attention
         if dvs:
             self.pool = Erode()
         self.scale = 0.125
@@ -166,6 +168,11 @@ class MS_SSA_Conv(nn.Module):
         self.layer = layer
 
     def forward(self, x, hook=None):
+        # Skip this layer if skip_attention is True
+        if self.skip_attention:
+            return x, None, hook
+        
+            
         T, B, C, H, W = x.shape
         identity = x
         N = H * W
@@ -261,6 +268,7 @@ class MS_Block_Conv(nn.Module):
         spike_mode="lif",
         dvs=False,
         layer=0,
+        skip_attention=False,
     ):
         super().__init__()
         self.attn = MS_SSA_Conv(
@@ -275,6 +283,7 @@ class MS_Block_Conv(nn.Module):
             spike_mode=spike_mode,
             dvs=dvs,
             layer=layer,
+            skip_attention=skip_attention,
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         mlp_hidden_dim = int(dim * mlp_ratio)
